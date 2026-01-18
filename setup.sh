@@ -42,11 +42,17 @@ sudo systemctl enable mariadb
 sudo systemctl start mariadb
 
 # -------------------------------
-# Tworzenie bazy danych i tabel
+# Tworzenie bazy danych i użytkownika
 # -------------------------------
-echo "Tworzenie bazy danych i tabel..."
-# Zakłada, że root nie ma hasła. Jeśli masz hasło, dodaj -p
-mysql -u root <<EOF
+echo "Tworzenie bazy danych i użytkownika..."
+
+sudo mariadb <<EOF
+CREATE DATABASE IF NOT EXISTS biblioteka CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'biblioteka_user'@'localhost' IDENTIFIED BY 'biblioteka_pass';
+GRANT ALL PRIVILEGES ON biblioteka.* TO 'biblioteka_user'@'localhost';
+FLUSH PRIVILEGES;
+
+-- Ładowanie tabel z pliku db_setup.sql
 SOURCE $(pwd)/db_setup.sql;
 EOF
 
