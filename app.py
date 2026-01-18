@@ -1,12 +1,11 @@
 import mysql.connector
 import bcrypt
 from getpass import getpass
-from datetime import date, timedelta
 from tabulate import tabulate
 
 # ---------------- Konfiguracja bazy ----------------
 DB_NAME = "biblioteka"
-DB_USER = "biblioteka_user"  # zgodnie z setup.sh
+DB_USER = "biblioteka_user"
 DB_PASSWORD = "biblioteka_pass"
 DB_HOST = "localhost"
 
@@ -17,7 +16,7 @@ conn = mysql.connector.connect(
     password=DB_PASSWORD,
     database=DB_NAME
 )
-cur = conn.cursor()
+cur = conn.cursor(dictionary=True)
 print("Połączono z bazą")
 
 # ---------------- Bezpieczeństwo haseł ----------------
@@ -47,13 +46,15 @@ def register_user():
 def login():
     username = input("Nazwa użytkownika: ")
     password = getpass("Hasło: ")
-    cur.execute("SELECT user_id, password_hash, role FROM users WHERE username=%s", (username,))
+    cur.execute("SELECT user_id, password_hash FROM users WHERE username=%s", (username,))
     row = cur.fetchone()
     if not row:
         print("Błędny login lub hasło.")
         return None
-    user_id, password_hash, role = row
+    user_id, password_hash = row["user_id"], row["password_hash"]
     if check_password(password, password_hash):
+        cur.execute("SELECT check_user_role(%s) AS role", (user_id,))
+        role = cur.fetchone()["role"]
         print(f"Zalogowano jako {role}")
         return {"id": user_id, "role": role}
     else:
@@ -63,38 +64,16 @@ def login():
 # ---------------- CRUD książek ----------------
 def add_book():
     title = input("Tytuł: ")
-    author_name = input("Autor: ")
-    category_name = input("Kategoria: ")
+    author = input("Autor: ")
+    category = input("Kategoria: ")
     total = int(input("Liczba egzemplarzy: "))
-
-    # Dodaj autora jeśli nie istnieje
-    cur.execute("SELECT author_id FROM authors WHERE name=%s", (author_name,))
-    author = cur.fetchone()
-    if author:
-        author_id = author[0]
-    else:
-        cur.execute("INSERT INTO authors (name) VALUES (%s)", (author_name,))
+    try:
+        cur.callproc("add_book_proc", [title, author, category, total])
         conn.commit()
-        author_id = cur.lastrowid
-
-    # Dodaj kategorię jeśli nie istnieje
-    cur.execute("SELECT category_id FROM categories WHERE name=%s", (category_name,))
-    category = cur.fetchone()
-    if category:
-        category_id = category[0]
-    else:
-        cur.execute("INSERT INTO categories (name) VALUES (%s)", (category_name,))
-        conn.commit()
-        category_id = cur.lastrowid
-
-    # Dodaj książkę
-    cur.execute(
-        "INSERT INTO books (title, author_id, category_id, total_copies, available_copies) "
-        "VALUES (%s, %s, %s, %s, %s)",
-        (title, author_id, category_id, total, total)
-    )
-    conn.commit()
-    print("Książka dodana.")
+        print("Książka dodana.")
+    except mysql.connector.Error as e:
+        conn.rollback()
+        print("Błąd:", e)
 
 def list_books():
     cur.execute("""
@@ -108,38 +87,15 @@ def list_books():
     if not rows:
         print("Brak książek w bibliotece.")
         return
-    print(tabulate(rows, headers=["ID", "Tytuł", "Autor", "Kategoria", "Dostępne"], tablefmt="grid"))
+    data = [[r["book_id"], r["title"], r["author"], r["category"], r["available_copies"]] for r in rows]
+    print(tabulate(data, headers=["ID", "Tytuł", "Autor", "Kategoria", "Dostępne"], tablefmt="grid"))
 
 # ---------------- Wypożyczenia ----------------
 def borrow_book(user_id):
     list_books()
     book_id = int(input("ID książki do wypożyczenia: "))
-
-    # Sprawdzenie dostępności
-    cur.execute("SELECT available_copies FROM books WHERE book_id=%s", (book_id,))
-    row = cur.fetchone()
-    if not row:
-        print("Nieprawidłowe ID książki.")
-        return
-    available = row[0]
-    if available < 1:
-        print("Brak dostępnych egzemplarzy.")
-        return
-
-    due = date.today() + timedelta(days=14)
     try:
-        cur.execute(
-            "INSERT INTO borrowings (user_id, book_id, due_date) VALUES (%s, %s, %s)",
-            (user_id, book_id, due)
-        )
-        cur.execute(
-            "UPDATE books SET available_copies = available_copies - 1 WHERE book_id=%s",
-            (book_id,)
-        )
-        cur.execute(
-            "INSERT INTO logs (user_id, action) VALUES (%s, %s)",
-            (user_id, f"Wypożyczył książkę {book_id}")
-        )
+        cur.callproc("borrow_book_proc", [user_id, book_id])
         conn.commit()
         print("Wypożyczono książkę.")
     except mysql.connector.Error as e:
@@ -147,6 +103,7 @@ def borrow_book(user_id):
         print("Błąd:", e)
 
 def return_book(user_id):
+    # Pobranie aktywnych wypożyczeń użytkownika
     cur.execute("""
         SELECT borrowing_id, book_id, due_date FROM borrowings 
         WHERE user_id=%s AND return_date IS NULL
@@ -155,45 +112,27 @@ def return_book(user_id):
     if not borrows:
         print("Brak aktywnych wypożyczeń.")
         return
-    print(tabulate(borrows, headers=["ID Wypożyczenia", "ID Książki", "Termin"], tablefmt="grid"))
+    data = [[r["borrowing_id"], r["book_id"], r["due_date"]] for r in borrows]
+    print(tabulate(data, headers=["ID Wypożyczenia", "ID Książki", "Termin"], tablefmt="grid"))
     borrow_id = int(input("ID wypożyczenia do zwrotu: "))
-
-    # Pobranie book_id
-    cur.execute("SELECT book_id FROM borrowings WHERE borrowing_id=%s", (borrow_id,))
-    row = cur.fetchone()
-    if not row:
-        print("Nieprawidłowe ID wypożyczenia.")
-        return
-    book_id = row[0]
-
-    cur.execute("UPDATE borrowings SET return_date=CURDATE() WHERE borrowing_id=%s", (borrow_id,))
-    cur.execute(
-        "UPDATE books SET available_copies = available_copies + 1 WHERE book_id=%s",
-        (book_id,)
-    )
-    cur.execute(
-        "INSERT INTO logs (user_id, action) VALUES (%s, %s)",
-        (user_id, f"Zwrócił książkę {book_id}")
-    )
-    conn.commit()
-    print("Książka zwrócona.")
+    try:
+        cur.callproc("return_book_proc", [borrow_id])
+        conn.commit()
+        print("Książka zwrócona.")
+    except mysql.connector.Error as e:
+        conn.rollback()
+        print("Błąd:", e)
 
 # ---------------- Raporty ----------------
 def overdue_books():
-    cur.execute("""
-        SELECT b.borrowing_id, u.username, bo.title, a.name AS author, c.name AS category, b.due_date
-        FROM borrowings b
-        JOIN users u ON b.user_id = u.user_id
-        JOIN books bo ON b.book_id = bo.book_id
-        LEFT JOIN authors a ON bo.author_id = a.author_id
-        LEFT JOIN categories c ON bo.category_id = c.category_id
-        WHERE b.return_date IS NULL AND b.due_date < CURDATE()
-    """)
-    rows = cur.fetchall()
+    # Wywołanie procedury, która SELECTuje
+    cur.execute("CALL overdue_books_proc()")  # execute zamiast callproc
+    rows = cur.fetchall()  # fetch po execute
     if not rows:
         print("Brak przeterminowanych wypożyczeń.")
         return
-    print(tabulate(rows, headers=["ID Wypożyczenia", "Czytelnik", "Tytuł", "Autor", "Kategoria", "Termin"], tablefmt="grid"))
+    data = [[r["borrowing_id"], r["username"], r["book_title"], r["author_name"], r["category_name"], r["due_date"]] for r in rows]
+    print(tabulate(data, headers=["ID Wypożyczenia", "Czytelnik", "Tytuł", "Autor", "Kategoria", "Termin"], tablefmt="grid"))
 
 # ---------------- Menu terminalowe ----------------
 def main():
